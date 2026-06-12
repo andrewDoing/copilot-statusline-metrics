@@ -2,6 +2,8 @@
 
 Copilot Statusline Metrics adds a Copilot CLI status line that shows current turn time, total active agent time, and persisted AIC usage for the current conversation.
 
+![Copilot CLI statusline showing last turn, total active time, and AIC conversation usage](docs/assets/statusline-screenshot.png)
+
 ```text
 Timer Turn 00:08 | Total active 03:41 | AIC convo 66
 Timer Last turn 00:12 | Total active 03:53 | AIC convo 68
