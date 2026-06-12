@@ -1,0 +1,7 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.copilot/bin/copilot-statusline-metrics",
+    "padding": 1
+  }
+}

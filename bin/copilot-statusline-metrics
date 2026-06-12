@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+payload="$(cat)"
+now="$(date +%s)"
+copilot_home="${COPILOT_HOME:-$HOME/.copilot}"
+metrics_db="${COPILOT_STATUSLINE_DB:-$copilot_home/statusline-metrics.db}"
+
+for dependency in jq sqlite3 awk sed date; do
+  if ! command -v "$dependency" >/dev/null 2>&1; then
+    exit 0
+  fi
+done
+
+mkdir -p "$(dirname "$metrics_db")"
+
+session_id="$(
+  jq -r '
+    .session_id
+    // .sessionId
+    // .session.id
+    // .id
+    // empty
+  ' <<<"$payload" 2>/dev/null
+)"
+
+current_aic_nano="$(
+  jq -r '
+    if .ai_used.total_nano_aiu? != null then
+      .ai_used.total_nano_aiu
+    elif (.ai_used.formatted? | tonumber?) != null then
+      ((.ai_used.formatted | tonumber) * 1000000000)
+    else
+      empty
+    end
+    | floor
+  ' <<<"$payload" 2>/dev/null || true
+)"
+
+transcript_path="$(
+  jq -r '.transcript_path // .transcriptPath // empty' <<<"$payload" 2>/dev/null
+)"
+
+events_file="$transcript_path"
+if [[ -d "$events_file" ]]; then
+  events_file="$events_file/events.jsonl"
+fi
+
+if [[ ! -r "$events_file" ]]; then
+  exit 0
+fi
+
+timer_status="$(
+  jq -rs --argjson now "$now" '
+    def epoch:
+      .timestamp
+      | sub("\\.[0-9]+Z$"; "Z")
+      | fromdateiso8601;
+
+    def starts_or_continues_work:
+      .type == "assistant.turn_start"
+      or .type == "assistant.message"
+      or .type == "tool.execution_start"
+      or .type == "tool.execution_complete"
+      or (.type | startswith("permission."));
+
+    def close_completed_turn:
+      if .turn_start != null and .turn_end != null then
+        (.turn_end - .turn_start) as $turn_duration
+        | .total += $turn_duration
+        | .last_turn = $turn_duration
+        | .last_turn_start = .turn_start
+        | .turn_start = null
+        | .turn_end = null
+      else
+        .
+      end;
+
+    reduce (
+      .[]
+      | select(.timestamp? != null)
+      | . + {epoch: epoch}
+    ) as $event (
+      {total: 0, last_turn: 0, last_turn_start: null, turn_start: null, turn_end: null};
+      if $event.type == "user.message" then
+        close_completed_turn
+        | .turn_start = $event.epoch
+        | .turn_end = null
+      elif .turn_start != null and $event.type == "assistant.turn_end" then
+        .turn_end = $event.epoch
+      elif .turn_start != null and ($event | starts_or_continues_work) then
+        .turn_end = null
+      else
+        .
+      end
+    )
+    | if .turn_start == null then
+        {
+          active: false,
+          turn: (.last_turn | floor),
+          total: (.total | floor),
+          turn_start: .last_turn_start
+        }
+      elif .turn_end == null then
+        {
+          active: true,
+          turn: (($now - .turn_start) | floor),
+          total: ((.total + ($now - .turn_start)) | floor),
+          turn_start: .turn_start
+        }
+      else
+        (.turn_end - .turn_start) as $turn_duration
+        |
+        {
+          active: false,
+          turn: ($turn_duration | floor),
+          total: ((.total + $turn_duration) | floor),
+          turn_start: .turn_start
+        }
+      end
+  ' "$events_file" 2>/dev/null || true
+)"
+
+if [[ -z "$timer_status" ]]; then
+  exit 0
+fi
+
+active="$(jq -r '.active // false' <<<"$timer_status" 2>/dev/null)"
+turn_elapsed="$(jq -r '.turn // 0' <<<"$timer_status" 2>/dev/null)"
+total_elapsed="$(jq -r '.total // 0' <<<"$timer_status" 2>/dev/null)"
+
+if [[ "$active" != "true" && "$turn_elapsed" == "0" && "$total_elapsed" == "0" ]]; then
+  exit 0
+fi
+
+format_duration() {
+  local elapsed="$1"
+  local hours=$((elapsed / 3600))
+  local minutes=$(((elapsed % 3600) / 60))
+  local seconds=$((elapsed % 60))
+
+  if ((hours > 0)); then
+    printf '%d:%02d:%02d' "$hours" "$minutes" "$seconds"
+  else
+    printf '%02d:%02d' "$minutes" "$seconds"
+  fi
+}
+
+format_aic() {
+  local nano="$1"
+  awk -v nano="$nano" '
+    BEGIN {
+      credits = nano / 1000000000
+      if (credits >= 100 || credits == int(credits)) {
+        printf "%.0f", credits
+      } else if (credits >= 10) {
+        printf "%.1f", credits
+      } else {
+        printf "%.2f", credits
+      }
+    }
+  '
+}
+
+sql_escape() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
+sqlite3 "$metrics_db" >/dev/null 2>&1 <<SQL || true
+PRAGMA busy_timeout = 1000;
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+INSERT INTO schema_meta (key, value, updated_at)
+VALUES ('schema_version', '1', $now)
+ON CONFLICT(key) DO UPDATE SET
+  value = excluded.value,
+  updated_at = excluded.updated_at;
+CREATE TABLE IF NOT EXISTS conversations (
+  conversation_id TEXT PRIMARY KEY,
+  transcript_path TEXT,
+  persisted_aic_nano INTEGER NOT NULL DEFAULT 0,
+  last_observed_aic_nano INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS aic_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  conversation_id TEXT NOT NULL,
+  delta_aic_nano INTEGER NOT NULL CHECK(delta_aic_nano >= 0),
+  observed_aic_nano INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_aic_events_created_at ON aic_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_aic_events_conversation_id ON aic_events(conversation_id);
+CREATE VIEW IF NOT EXISTS aic_daily AS
+SELECT
+  date(created_at, 'unixepoch', 'localtime') AS day,
+  SUM(delta_aic_nano) / 1000000000.0 AS aic,
+  COUNT(DISTINCT conversation_id) AS conversations
+FROM aic_events
+GROUP BY day;
+CREATE VIEW IF NOT EXISTS aic_weekly AS
+SELECT
+  strftime('%Y-W%W', created_at, 'unixepoch', 'localtime') AS week,
+  SUM(delta_aic_nano) / 1000000000.0 AS aic,
+  COUNT(DISTINCT conversation_id) AS conversations
+FROM aic_events
+GROUP BY week;
+CREATE VIEW IF NOT EXISTS aic_monthly AS
+SELECT
+  strftime('%Y-%m', created_at, 'unixepoch', 'localtime') AS month,
+  SUM(delta_aic_nano) / 1000000000.0 AS aic,
+  COUNT(DISTINCT conversation_id) AS conversations
+FROM aic_events
+GROUP BY month;
+SQL
+
+persisted_aic_nano=""
+conversation_id="${session_id:-$transcript_path}"
+if [[ -n "$conversation_id" ]]; then
+  conversation_sql="$(sql_escape "$conversation_id")"
+  transcript_sql="$(sql_escape "$transcript_path")"
+
+  if [[ -n "$current_aic_nano" ]]; then
+    aic_row="$(
+      sqlite3 "$metrics_db" 2>/dev/null <<SQL || true
+SELECT persisted_aic_nano || '|' || COALESCE(last_observed_aic_nano, -1)
+FROM conversations
+WHERE conversation_id = '$conversation_sql';
+SQL
+    )"
+
+    if [[ -n "$aic_row" ]]; then
+      persisted_previous="${aic_row%%|*}"
+      last_observed="${aic_row#*|}"
+    else
+      persisted_previous="0"
+      last_observed="-1"
+    fi
+
+    observed_to_store="$current_aic_nano"
+    if ((last_observed < 0)); then
+      aic_delta="$current_aic_nano"
+    elif ((current_aic_nano >= last_observed)); then
+      aic_delta=$((current_aic_nano - last_observed))
+    elif ((current_aic_nano == 0 && last_observed > 0)); then
+      aic_delta="0"
+      observed_to_store="$last_observed"
+    else
+      aic_delta="$current_aic_nano"
+    fi
+
+    persisted_aic_nano=$((persisted_previous + aic_delta))
+
+    sqlite3 "$metrics_db" >/dev/null 2>&1 <<SQL || true
+PRAGMA busy_timeout = 1000;
+BEGIN IMMEDIATE;
+INSERT INTO conversations (
+  conversation_id,
+  transcript_path,
+  persisted_aic_nano,
+  last_observed_aic_nano,
+  created_at,
+  updated_at
+) VALUES (
+  '$conversation_sql',
+  '$transcript_sql',
+  $persisted_aic_nano,
+  $observed_to_store,
+  $now,
+  $now
+)
+ON CONFLICT(conversation_id) DO UPDATE SET
+  transcript_path = excluded.transcript_path,
+  persisted_aic_nano = excluded.persisted_aic_nano,
+  last_observed_aic_nano = excluded.last_observed_aic_nano,
+  updated_at = excluded.updated_at;
+INSERT INTO aic_events (
+  conversation_id,
+  delta_aic_nano,
+  observed_aic_nano,
+  created_at
+)
+SELECT
+  '$conversation_sql',
+  $aic_delta,
+  $observed_to_store,
+  $now
+WHERE $aic_delta > 0;
+COMMIT;
+SQL
+  else
+    persisted_aic_nano="$(
+      sqlite3 "$metrics_db" 2>/dev/null <<SQL || true
+SELECT persisted_aic_nano
+FROM conversations
+WHERE conversation_id = '$conversation_sql';
+SQL
+    )"
+  fi
+fi
+
+aic_suffix=""
+if [[ -n "$persisted_aic_nano" ]]; then
+  aic_suffix=" | AIC convo $(format_aic "$persisted_aic_nano")"
+fi
+
+if [[ "$active" == "true" ]]; then
+  printf 'Timer Turn %s | Total active %s%s' "$(format_duration "$turn_elapsed")" "$(format_duration "$total_elapsed")" "$aic_suffix"
+else
+  printf 'Timer Last turn %s | Total active %s%s' "$(format_duration "$turn_elapsed")" "$(format_duration "$total_elapsed")" "$aic_suffix"
+fi

@@ -1,0 +1,11 @@
+{
+  "name": "copilot-statusline-metrics",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Copilot CLI statusline timer and persistent AIC metrics.",
+  "type": "module",
+  "scripts": {
+    "test": "./tests/run.sh",
+    "check:extension": "node --check .github/extensions/copilot-statusline-metrics/extension.mjs"
+  }
+}
