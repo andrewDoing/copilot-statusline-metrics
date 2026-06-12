@@ -225,39 +225,43 @@ if [[ -n "$conversation_id" ]]; then
   transcript_sql="$(sql_escape "$transcript_path")"
 
   if [[ -n "$current_aic_nano" ]]; then
-    aic_row="$(
+    persisted_aic_nano="$(
       sqlite3 "$metrics_db" 2>/dev/null <<SQL || true
-SELECT persisted_aic_nano || '|' || COALESCE(last_observed_aic_nano, -1)
+.timeout 1000
+BEGIN IMMEDIATE;
+INSERT OR IGNORE INTO conversations (
+  conversation_id,
+  transcript_path,
+  persisted_aic_nano,
+  last_observed_aic_nano,
+  created_at,
+  updated_at
+) VALUES (
+  '$conversation_sql',
+  '$transcript_sql',
+  0,
+  -1,
+  $now,
+  $now
+);
+CREATE TEMP TABLE aic_calc (
+  delta_aic_nano INTEGER NOT NULL,
+  observed_aic_nano INTEGER NOT NULL
+);
+INSERT INTO aic_calc (delta_aic_nano, observed_aic_nano)
+SELECT
+  CASE
+    WHEN COALESCE(last_observed_aic_nano, -1) < 0 THEN $current_aic_nano
+    WHEN $current_aic_nano >= COALESCE(last_observed_aic_nano, -1) THEN $current_aic_nano - COALESCE(last_observed_aic_nano, -1)
+    WHEN $current_aic_nano = 0 AND COALESCE(last_observed_aic_nano, -1) > 0 THEN 0
+    ELSE $current_aic_nano
+  END,
+  CASE
+    WHEN $current_aic_nano = 0 AND COALESCE(last_observed_aic_nano, -1) > 0 AND $current_aic_nano < COALESCE(last_observed_aic_nano, -1) THEN COALESCE(last_observed_aic_nano, -1)
+    ELSE $current_aic_nano
+  END
 FROM conversations
 WHERE conversation_id = '$conversation_sql';
-SQL
-    )"
-
-    if [[ -n "$aic_row" ]]; then
-      persisted_previous="${aic_row%%|*}"
-      last_observed="${aic_row#*|}"
-    else
-      persisted_previous="0"
-      last_observed="-1"
-    fi
-
-    observed_to_store="$current_aic_nano"
-    if ((last_observed < 0)); then
-      aic_delta="$current_aic_nano"
-    elif ((current_aic_nano >= last_observed)); then
-      aic_delta=$((current_aic_nano - last_observed))
-    elif ((current_aic_nano == 0 && last_observed > 0)); then
-      aic_delta="0"
-      observed_to_store="$last_observed"
-    else
-      aic_delta="$current_aic_nano"
-    fi
-
-    persisted_aic_nano=$((persisted_previous + aic_delta))
-
-    sqlite3 "$metrics_db" >/dev/null 2>&1 <<SQL || true
-PRAGMA busy_timeout = 1000;
-BEGIN IMMEDIATE;
 INSERT INTO conversations (
   conversation_id,
   transcript_path,
@@ -268,14 +272,14 @@ INSERT INTO conversations (
 ) VALUES (
   '$conversation_sql',
   '$transcript_sql',
-  $persisted_aic_nano,
-  $observed_to_store,
+  (SELECT delta_aic_nano FROM aic_calc),
+  (SELECT observed_aic_nano FROM aic_calc),
   $now,
   $now
 )
 ON CONFLICT(conversation_id) DO UPDATE SET
   transcript_path = excluded.transcript_path,
-  persisted_aic_nano = excluded.persisted_aic_nano,
+  persisted_aic_nano = conversations.persisted_aic_nano + (SELECT delta_aic_nano FROM aic_calc),
   last_observed_aic_nano = excluded.last_observed_aic_nano,
   updated_at = excluded.updated_at;
 INSERT INTO aic_events (
@@ -286,12 +290,17 @@ INSERT INTO aic_events (
 )
 SELECT
   '$conversation_sql',
-  $aic_delta,
-  $observed_to_store,
+  delta_aic_nano,
+  observed_aic_nano,
   $now
-WHERE $aic_delta > 0;
+FROM aic_calc
+WHERE delta_aic_nano > 0;
+SELECT persisted_aic_nano
+FROM conversations
+WHERE conversation_id = '$conversation_sql';
 COMMIT;
 SQL
+    )"
   else
     persisted_aic_nano="$(
       sqlite3 "$metrics_db" 2>/dev/null <<SQL || true

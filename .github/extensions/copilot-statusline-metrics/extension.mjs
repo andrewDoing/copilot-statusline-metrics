@@ -141,7 +141,8 @@ const session = await joinSession({
                 }
                 await rm(hookPath, { force: true });
                 await rm(join(copilotHome, "skills", "aic-metrics"), { recursive: true, force: true });
-                return `Removed hook and skill. Metrics database remains at ${dbPath}.`;
+                await rm(join(copilotHome, "extensions", "copilot-statusline-metrics"), { recursive: true, force: true });
+                return `Removed hook, skill, and extension. Metrics database remains at ${dbPath}.`;
             },
         },
     ],

@@ -49,6 +49,12 @@ bash -n "$repo_root/uninstall.sh"
 node --check "$repo_root/.github/extensions/copilot-statusline-metrics/extension.mjs" >/dev/null
 pass "syntax checks"
 
+if grep -q 'extensions", "copilot-statusline-metrics"' "$repo_root/.github/extensions/copilot-statusline-metrics/extension.mjs"; then
+  pass "extension uninstall removes extension directory"
+else
+  fail "extension uninstall removes extension directory"
+fi
+
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
