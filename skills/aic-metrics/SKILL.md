@@ -1,3 +1,8 @@
+---
+name: aic-metrics
+description: Query Copilot CLI statusline SQLite metrics for AIC usage by day, week, month, conversation, and event.
+---
+
 # AIC Metrics Query Skill
 
 Goal: Help the user inspect Copilot CLI AIC usage captured by the statusline metrics database.
