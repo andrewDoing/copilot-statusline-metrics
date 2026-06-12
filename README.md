@@ -25,7 +25,14 @@ Timer Last turn 00:12 | Total active 03:53 | AIC convo 68
 
 ## Install
 
-Clone the repository and run:
+Clone the repository:
+
+```bash
+git clone https://github.com/andrewDoing/copilot-statusline-metrics.git
+cd copilot-statusline-metrics
+```
+
+Run the installer:
 
 ```bash
 ./install.sh
@@ -50,6 +57,24 @@ The installer updates `~/.copilot/settings.json`:
 ```
 
 Restart Copilot CLI or run `/restart` after installing.
+
+Confirm the extension loaded:
+
+```text
+/env
+```
+
+Ask Copilot to query the installed extension:
+
+```text
+Use copilot_statusline_metrics_status to show the statusline metrics setup.
+```
+
+Run the local test suite:
+
+```bash
+npm test
+```
 
 ## Query AIC usage
 
